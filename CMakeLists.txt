@@ -200,6 +200,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(repo-common repo-core repo-backend)
 
+find_package(OpenSSL REQUIRED)
+
 #
 # CUDA
 #
@@ -301,6 +303,8 @@ target_link_libraries(
     triton-backend-utils    # from repo-backend
     ${TRITON_ONNXRUNTIME_LDFLAGS}
     ${ONNXRUNTIME_LIBRARY}
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 if(${TRITON_ENABLE_GPU})
