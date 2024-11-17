@@ -31,6 +31,11 @@
 #include <locale>
 #include <string>
 #include <thread>
+#include <openssl/evp.h>
+#include <openssl/md5.h>
+#include <fstream>
+#include <vector>
+#include <cstdlib>
 
 #include "onnxruntime_utils.h"
 
@@ -163,17 +168,84 @@ OnnxLoader::IsGlobalThreadPoolEnabled()
   return false;
 }
 
+std::vector<unsigned char> get_decrypt_key_and_iv_from_env() {
+    const char* key_env = std::getenv("DECRYPT_KEY");
+    if (!key_env) {
+        return {};
+    }
+    std::string key_hex = std::string(key_env);
+    
+    if (key_hex.size() != 96) {
+        throw std::runtime_error("The key length must be 96");
+    }
+
+    std::vector<unsigned char> key_bytes;
+    for (size_t i = 0; i < key_hex.size(); i += 2) {
+        std::string byte_string = key_hex.substr(i, 2);
+        unsigned char byte = static_cast<unsigned char>(std::stoi(byte_string, nullptr, 16));
+        key_bytes.push_back(byte);
+    }
+    return key_bytes;
+}
+
+std::vector<unsigned char> decrypt(const std::vector<unsigned char>& encrypted_data, const std::vector<unsigned char>& key_and_iv) {
+    constexpr size_t key_size = 32; // in bytes or 64 in hex
+    constexpr size_t iv_size = 16;
+
+    if (key_and_iv.size() != key_size + iv_size) {
+        throw std::invalid_argument("key_and_iv must contain both key and IV with lengths 32 + 16 bytes.");
+    }
+
+    const unsigned char* key = key_and_iv.data();
+    const unsigned char* iv = key_and_iv.data() + key_size;
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    std::vector<unsigned char> decrypted_data(encrypted_data.size());
+    EVP_DecryptInit_ex(ctx, EVP_aes_256_cfb(), NULL, key, iv);
+
+    int outlen1 = 0;
+    EVP_DecryptUpdate(ctx, decrypted_data.data(), &outlen1, 
+                          encrypted_data.data(), 
+                          static_cast<int>(encrypted_data.size()));
+
+    int outlen2 = 0;
+    EVP_DecryptFinal_ex(ctx, decrypted_data.data() + outlen1, &outlen2);
+    EVP_CIPHER_CTX_free(ctx);
+
+    decrypted_data.resize(outlen1 + outlen2);
+    return decrypted_data;
+}
+
+std::vector<unsigned char> read_file(const std::string& filename) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Can't open file: " + filename);
+    }
+
+    std::vector<unsigned char> buffer((std::istreambuf_iterator<char>(file)),
+                                       std::istreambuf_iterator<char>());
+    return buffer;
+}
+
 TRITONSERVER_Error*
 OnnxLoader::LoadSession(
-    const bool is_path, const std::string& model,
+    bool is_path, const std::string& model,
     const OrtSessionOptions* session_options, OrtSession** session)
 {
 #ifdef _WIN32
   std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
   std::wstring ort_style_model_str = converter.from_bytes(model);
 #else
-  const auto& ort_style_model_str = model;
+  std::string ort_style_model_str = model;
 #endif
+  std::vector<unsigned char> key = get_decrypt_key_and_iv_from_env();
+  if (!key.empty() && is_path) {
+    LOG_MESSAGE(TRITONSERVER_LOG_INFO, "Decrypting model");
+    std::vector<unsigned char> model_bytes = read_file(ort_style_model_str);
+    std::vector<unsigned char> decrypted_model = decrypt(model_bytes, key);
+    ort_style_model_str = std::string(decrypted_model.begin(), decrypted_model.end());
+    is_path = false;
+  }
   if (loader != nullptr) {
     {
       std::lock_guard<std::mutex> lk(loader->mu_);
@@ -193,7 +265,7 @@ OnnxLoader::LoadSession(
 
       if (!is_path) {
         status = ort_api->CreateSessionFromArray(
-            loader->env_, ort_style_model_str.c_str(), model.size(),
+            loader->env_, ort_style_model_str.c_str(), ort_style_model_str.size(),
             session_options, session);
       } else {
         status = ort_api->CreateSession(
